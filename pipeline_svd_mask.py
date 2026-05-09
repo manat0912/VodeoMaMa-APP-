@@ -869,12 +869,12 @@ class VideoInferencePipeline:
         except Exception as e:
             raise IOError(f"Fatal error loading models: {e}")
 
-        # Move models to the specified device and set to evaluation mode
-        self.image_encoder.to(self.device, dtype=self.weight_dtype).eval()
-        self.vae.to(self.device, dtype=self.weight_dtype).eval()
-        self.unet.to(self.device, dtype=self.weight_dtype).eval()
+        # Move models to the CPU initially to save VRAM
+        self.image_encoder.to("cpu", dtype=self.weight_dtype).eval()
+        self.vae.to("cpu", dtype=self.weight_dtype).eval()
+        self.unet.to("cpu", dtype=self.weight_dtype).eval()
 
-        print(f"--- Models Loaded Successfully on {self.device} ---")
+        print(f"--- Models Loaded Successfully (Memory offloading prepared) ---")
 
     def run(self, cond_frames, mask_frames, seed=42, mask_cond_mode="vae", fps=7, motion_bucket_id=127,
             noise_aug_strength=0.0):
@@ -893,7 +893,12 @@ class VideoInferencePipeline:
         Returns:
             list[Image.Image]: A list of the generated video frames as PIL Images.
         """
+        # Clear cache before starting
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         # --- 1. Prepare Tensors ---
+        from torchvision import transforms
         cond_video_tensor = self._pil_to_tensor(cond_frames).to(self.device)
         mask_video_tensor = self._pil_to_tensor(mask_frames).to(self.device)
 
@@ -902,14 +907,19 @@ class VideoInferencePipeline:
 
         with torch.no_grad():
             # --- 2. Get CLIP Image Embeddings ---
+            self.image_encoder.to(self.device)
             first_frame_tensor = cond_video_tensor[:, 0, :, :, :]
             pixel_values_for_clip = self._resize_with_antialiasing(first_frame_tensor, (224, 224))
             pixel_values_for_clip = ((pixel_values_for_clip + 1.0) / 2.0).clamp(0, 1)
             pixel_values = self.feature_extractor(images=pixel_values_for_clip, return_tensors="pt").pixel_values
             image_embeddings = self.image_encoder(pixel_values.to(self.device, dtype=self.weight_dtype)).image_embeds
             encoder_hidden_states = torch.zeros_like(image_embeddings).unsqueeze(1)
+            self.image_encoder.to("cpu")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
             # --- 3. Prepare Latents ---
+            self.vae.to(self.device)
             cond_latents = self._tensor_to_vae_latent(cond_video_tensor.to(self.weight_dtype))
             cond_latents = cond_latents / self.vae.config.scaling_factor
 
@@ -919,14 +929,21 @@ class VideoInferencePipeline:
             elif mask_cond_mode == "interpolate":
                 target_shape = cond_latents.shape[-2:]
                 b, t, c, h, w = mask_video_tensor.shape
+                from einops import rearrange
+                import torch.nn.functional as F
                 mask_video_reshaped = rearrange(mask_video_tensor, "b t c h w -> (b t) c h w")
                 interpolated_mask = F.interpolate(mask_video_reshaped, size=target_shape, mode='bilinear',
                                                   align_corners=False)
                 mask_latents = rearrange(interpolated_mask, "(b t) c h w -> b t c h w", b=b)
             else:
                 raise ValueError(f"Unknown mask_cond_mode: {mask_cond_mode}")
+            
+            self.vae.to("cpu")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
             # --- 4. Run UNet Single-Step Inference ---
+            self.unet.to(self.device)
             generator = torch.Generator(device=self.device).manual_seed(seed)
             noisy_latents = torch.randn(cond_latents.shape, generator=generator, device=self.device,
                                         dtype=self.weight_dtype)
@@ -935,16 +952,26 @@ class VideoInferencePipeline:
 
             unet_input = torch.cat([noisy_latents, cond_latents, mask_latents], dim=2)
             pred_latents = self.unet(unet_input, timesteps, encoder_hidden_states, added_time_ids=added_time_ids).sample
+            
+            self.unet.to("cpu")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
             # --- 5. Decode Latents to Video Frames ---
+            self.vae.to(self.device)
             pred_latents = (1 / self.vae.config.scaling_factor) * pred_latents.squeeze(0)
 
             frames = []
             # Process in chunks to avoid VRAM issues, especially for long videos
-            for i in range(0, pred_latents.shape[0], 8):
-                chunk = pred_latents[i: i + 8]
+            decode_chunk_size = 4 # reduce chunk size for decoding
+            for i in range(0, pred_latents.shape[0], decode_chunk_size):
+                chunk = pred_latents[i: i + decode_chunk_size]
                 decoded_chunk = self.vae.decode(chunk, num_frames=chunk.shape[0]).sample
                 frames.append(decoded_chunk)
+
+            self.vae.to("cpu")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
             video_tensor = torch.cat(frames, dim=0)
             video_tensor = (video_tensor / 2.0 + 0.5).clamp(0, 1).mean(dim=1, keepdim=True).repeat(1, 3, 1, 1)
@@ -952,16 +979,27 @@ class VideoInferencePipeline:
             # Return a list of PIL images
             return [transforms.ToPILImage()(frame) for frame in video_tensor]
 
-    def _pil_to_tensor(self, frames: list[Image.Image]):
+    def _pil_to_tensor(self, frames: list[PIL.Image.Image]):
         """Converts a list of PIL images to a normalized video tensor."""
+        from torchvision import transforms
         video_tensor = torch.stack([transforms.ToTensor()(f) for f in frames]).unsqueeze(0)
         return video_tensor * 2.0 - 1.0
 
     def _tensor_to_vae_latent(self, t: torch.Tensor):
         """Encodes a video tensor into the VAE's latent space."""
         video_length = t.shape[1]
+        from einops import rearrange
         t = rearrange(t, "b f c h w -> (b f) c h w")
-        latents = self.vae.encode(t).latent_dist.sample()
+        
+        # Process VAE encoding in chunks to avoid OOM
+        chunk_size = 4
+        latents_list = []
+        for i in range(0, t.shape[0], chunk_size):
+            chunk = t[i:i+chunk_size]
+            latent_chunk = self.vae.encode(chunk).latent_dist.sample()
+            latents_list.append(latent_chunk)
+            
+        latents = torch.cat(latents_list, dim=0)
         latents = rearrange(latents, "(b f) c h w -> b f c h w", f=video_length)
         return latents * self.vae.config.scaling_factor
 
